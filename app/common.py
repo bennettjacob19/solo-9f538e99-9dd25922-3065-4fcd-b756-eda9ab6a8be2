@@ -8,9 +8,13 @@ SQLite database in WAL mode:
   cache     -- the resolver's cache.  Absolute epoch deadlines are stored, so a
                resolver restart can never extend the validity of an old A
                record; the stale window simply keeps counting down.
-  query_log -- every client query the resolver answered, with its source.
+  query_log -- every client query the resolver answered, with its source and
+               the client IP the resolver saw.
   auth_log  -- every query the authoritative endpoint saw, with the action it
                took (answered / nxdomain / dropped / delayed).
+  resolver_stats -- one row of scheduler counters/gauges (in-flight upstream
+               fetches, queued waiters, cumulative grants/rejections) written
+               by the resolver and shown on the web console.
 """
 from __future__ import annotations
 
@@ -29,6 +33,12 @@ DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 FRESH_TTL = float(os.environ.get("FRESH_TTL", "5"))        # successful answers are fresh for 5s
 STALE_WINDOW = float(os.environ.get("STALE_WINDOW", "20"))  # stale A usable <=20s after expiry
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "2.0"))
+
+# Fair upstream scheduling (per source IP).
+MAX_INFLIGHT_TOTAL = int(os.environ.get("MAX_INFLIGHT_TOTAL", "2"))    # global in-flight upstream fetches
+MAX_INFLIGHT_PER_IP = int(os.environ.get("MAX_INFLIGHT_PER_IP", "1"))  # in-flight fetches per source IP
+MAX_QUEUED_PER_IP = int(os.environ.get("MAX_QUEUED_PER_IP", "2"))      # queued waiters per source IP
+QUEUE_WAIT_MAX = float(os.environ.get("QUEUE_WAIT_MAX", "4.0"))        # max seconds a waiter may queue
 
 AUTH_HOST = os.environ.get("AUTH_HOST", "127.0.0.1")
 AUTH_PORT = int(os.environ.get("AUTH_PORT", "5354"))
@@ -60,24 +70,50 @@ CREATE TABLE IF NOT EXISTS cache (
 CREATE TABLE IF NOT EXISTS query_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL NOT NULL,
-  qname TEXT, qtype TEXT, source TEXT, rcode TEXT, answers TEXT, detail TEXT
+  qname TEXT, qtype TEXT, source TEXT, rcode TEXT, answers TEXT, detail TEXT,
+  client TEXT
 );
 CREATE TABLE IF NOT EXISTS auth_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL NOT NULL,
   qname TEXT, qtype TEXT, mode TEXT, action TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS resolver_stats (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  inflight INTEGER NOT NULL DEFAULT 0,               -- current in-flight upstream fetches
+  queued INTEGER NOT NULL DEFAULT 0,                 -- current queued waiters
+  upstream_total INTEGER NOT NULL DEFAULT 0,         -- cumulative upstream fetches
+  grant_immediate_total INTEGER NOT NULL DEFAULT 0,  -- slots granted without queueing
+  grant_queued_total INTEGER NOT NULL DEFAULT 0,     -- slots granted after queueing
+  rejected_total INTEGER NOT NULL DEFAULT 0,         -- per-IP queue full -> no fetch
+  wait_timeout_total INTEGER NOT NULL DEFAULT 0,     -- waited > QUEUE_WAIT_MAX -> no fetch
+  updated_at REAL NOT NULL DEFAULT 0
+);
 """
 
 _LOG_TABLES = ("query_log", "auth_log")
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    return conn
+def _connect(retries: int = 30) -> sqlite3.Connection:
+    """Open a connection to the shared state plane.
+
+    All three processes initialise the database concurrently at startup, and
+    switching a freshly created database into WAL mode needs a brief
+    exclusive lock that the busy handler does not always cover -- so a
+    transient "database is locked" is retried for a few seconds.
+    """
+    last: sqlite3.OperationalError | None = None
+    for _ in range(retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=15)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last = exc
+            time.sleep(0.2)
+    raise last  # type: ignore[misc]
 
 
 def init_db() -> None:
@@ -91,6 +127,11 @@ def init_db() -> None:
             " VALUES (1, 'a', ?, ?, ?)",
             (DEFAULT_IP, DEFAULT_DELAY, time.time()),
         )
+        c.execute("INSERT OR IGNORE INTO resolver_stats(id) VALUES (1)")
+        # migration for databases created before query_log had a client column
+        cols = {r[1] for r in c.execute("PRAGMA table_info(query_log)")}
+        if "client" not in cols:
+            c.execute("ALTER TABLE query_log ADD COLUMN client TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -156,6 +197,39 @@ def put_cache_nxdomain(now: float) -> None:
 
 
 # --------------------------------------------------------------------------
+# resolver_stats (resolver writes, web reads)
+# --------------------------------------------------------------------------
+_STATS_COLS = (
+    "inflight", "queued", "upstream_total", "grant_immediate_total",
+    "grant_queued_total", "rejected_total", "wait_timeout_total",
+)
+
+
+def put_resolver_stats(fields: dict) -> None:
+    """Upsert the single resolver_stats row (best-effort scheduler telemetry)."""
+    cols = [k for k in _STATS_COLS if k in fields]
+    if not cols:
+        return
+    collist = ", ".join(cols)
+    marks = ", ".join("?" for _ in cols)
+    updates = ", ".join(f"{k}=excluded.{k}" for k in cols)
+    with _connect() as c:
+        c.execute(
+            f"INSERT INTO resolver_stats(id, {collist}, updated_at)"
+            f" VALUES (1, {marks}, ?)"
+            f" ON CONFLICT(id) DO UPDATE SET {updates},"
+            f"   updated_at=excluded.updated_at",
+            (*[fields[k] for k in cols], time.time()),
+        )
+
+
+def get_resolver_stats() -> dict | None:
+    with _connect() as c:
+        row = c.execute("SELECT * FROM resolver_stats WHERE id = 1").fetchone()
+        return dict(row) if row else None
+
+
+# --------------------------------------------------------------------------
 # logs
 # --------------------------------------------------------------------------
 def _log(table: str, columns: tuple[str, ...], values: tuple) -> None:
@@ -170,11 +244,11 @@ def _log(table: str, columns: tuple[str, ...], values: tuple) -> None:
         )
 
 
-def log_query(qname, qtype, source, rcode, answers, detail) -> None:
+def log_query(qname, qtype, source, rcode, answers, detail, client="") -> None:
     _log(
         "query_log",
-        ("ts", "qname", "qtype", "source", "rcode", "answers", "detail"),
-        (time.time(), qname, qtype, source, rcode, answers, detail),
+        ("ts", "qname", "qtype", "source", "rcode", "answers", "detail", "client"),
+        (time.time(), qname, qtype, source, rcode, answers, detail, client),
     )
 
 

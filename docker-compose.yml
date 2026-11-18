@@ -30,6 +30,10 @@ services:
       FRESH_TTL: "5"        # successful answers are fresh for 5s
       STALE_WINDOW: "20"    # stale A usable at most 20s past expiry
       UPSTREAM_TIMEOUT: "2" # seconds waiting for the authoritative endpoint
+      MAX_INFLIGHT_TOTAL: "2"    # global in-flight upstream fetches
+      MAX_INFLIGHT_PER_IP: "1"   # in-flight upstream fetches per source IP
+      MAX_QUEUED_PER_IP: "2"     # queued waiters per source IP
+      QUEUE_WAIT_MAX: "4"        # max seconds a queued request may wait
     ports:
       - "5353:5353/udp"
     volumes:
@@ -47,6 +51,8 @@ services:
       WEB_PORT: "8000"
       RESOLVER_HOST: resolver
       RESOLVER_PORT: "5353"
+      UPSTREAM_TIMEOUT: "2"   # used to size the console's own query timeout
+      QUEUE_WAIT_MAX: "4"
     ports:
       - "8000:8000"
     volumes:
